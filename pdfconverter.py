@@ -6,11 +6,14 @@ import os
 import tempfile
 import io
 import time
+import datetime
 from pypdf import PdfReader
 
 # ==========================================
 # 1. CORE ENGINE UTILITIES
 # ==========================================
+
+LINE_SCALE_DEFAULT = 40
 
 def get_total_pages(pdf_path):
     try:
@@ -62,11 +65,6 @@ def is_likely_header(row):
     return text_count > 0
 
 def align_table_header(df):
-    """
-    Scans the first 5 rows of an extracted table block.
-    Identifies the true header row and crops out any stray metadata/titles 
-    printed above it, ensuring all pages start on the exact same row.
-    """
     if df.empty:
         return df
         
@@ -79,9 +77,6 @@ def align_table_header(df):
     return df
 
 def detect_column_indices(df, header_row):
-    """
-    Dynamically finds the best index for Description and Anchor columns.
-    """
     normalized_headers = normalize_header_row(header_row)
     
     desc_keywords = ['desc', 'detail', 'particular', 'item', 'transaction', 'name', 'mauze']
@@ -90,19 +85,16 @@ def detect_column_indices(df, header_row):
     desc_idx = 0  
     anchor_idx = -1
     
-    # 1. Locate Description Column by keywords
     for i, header in enumerate(normalized_headers):
         if any(keyword in header for keyword in desc_keywords):
             desc_idx = i
             break
             
-    # 2. Locate Anchor Column by keywords
     for i, header in enumerate(normalized_headers):
         if i != desc_idx and any(keyword in header for keyword in anchor_keywords):
             anchor_idx = i
             break
             
-    # 3. Fallback to high-density column if no keyword matched for anchor
     if anchor_idx == -1:
         best_col = -1
         max_density = -1
@@ -129,7 +121,6 @@ def clean_ghost_rows_safe(df, desc_col_idx, anchor_col_idx):
     if len(df) <= 1: 
         return df
         
-    # Isolate Header Row securely
     header_df = df.iloc[[0]]
     data_df = df.iloc[1:].copy().reset_index(drop=True)
     
@@ -168,7 +159,6 @@ def zip_wrapped_text_optimized(df, desc_col_idx, anchor_col_idx):
     if len(df) <= 1 or len(df.columns) <= max(desc_col_idx, anchor_col_idx):
         return df
         
-    # Isolate Header Row securely
     header_df = df.iloc[[0]]
     data_df = df.iloc[1:].copy().reset_index(drop=True)
     
@@ -217,11 +207,27 @@ def remove_duplicate_headers(df, header_row):
     cleaned_data = data_df.drop(index=rows_to_drop).reset_index(drop=True)
     return pd.concat([header_df, cleaned_data], ignore_index=True)
 
-def clean_raw_strings(df):
+def parse_date_preserving_hyphen(val):
     """
-    Preserves raw strings exactly as extracted from the PDF [1].
-    Replaces visual 'nan'/'None' placeholder strings with None so Excel displays 
-    them as clean blanks, but leaves hyphens (-) completely untouched [1].
+    Parses date strings to datetime.date objects for Excel,
+    but protects hyphens from being converted [1].
+    """
+    val_str = str(val).strip()
+    if val_str in ['-', '—', '–', '.-']:
+        return val_str  # Preserve hyphen as raw string
+    if val_str in ['', 'nan', 'None']:
+        return None
+        
+    try:
+        dt = pd.to_datetime(val_str, errors='raise')
+        return dt.date()  # Returns date-only object
+    except Exception:
+        return val_str  # Fallback to string if unparseable
+
+def clean_raw_strings_and_type_dates(df):
+    """
+    Keeps string structures completely untouched, but dynamically identifies 
+    date columns to apply native datetime.date objects for proper Excel date filters [1].
     """
     if len(df) <= 1:
         return df
@@ -230,6 +236,21 @@ def clean_raw_strings(df):
     data_df = df.iloc[1:].copy().reset_index(drop=True)
     
     for col in data_df.columns:
+        sample_series = data_df[col].dropna().astype(str).str.strip()
+        sample_series = sample_series[~sample_series.isin(['', 'nan', 'None'])]
+        
+        if sample_series.empty:
+            data_df[col] = None
+            continue
+            
+        # Detect if this column contains dates
+        date_like_count = sample_series.str.contains(r'\d{1,4}[-/.]\d{1,2}[-/.]\d{1,4}').sum()
+        if (date_like_count / len(sample_series)) >= 0.75:
+            # Apply hybrid date-preservation parser [1]
+            data_df[col] = data_df[col].apply(parse_date_preserving_hyphen)
+            continue
+            
+        # For non-date columns, preserve exactly as string, replacing nan with None
         data_df[col] = data_df[col].apply(
             lambda x: None if str(x).strip() in ['nan', 'None'] else str(x).strip()
         )
@@ -237,7 +258,7 @@ def clean_raw_strings(df):
     return pd.concat([header_df, data_df], ignore_index=True)
 
 # ==========================================
-# 3. STREAMLIT FRONT-END UI
+# 4. STREAMLIT FRONT-END UI & LAYOUT
 # ==========================================
 
 st.set_page_config(
@@ -256,17 +277,16 @@ if uploaded_file is not None:
         temp_pdf.write(uploaded_file.read())
         temp_pdf_path = temp_pdf.name
         
-    total_pages = get_total_pages(temp_pdf_path)
+    total_pages_pdf = get_total_pages(temp_pdf_path)
     
-    st.info(f"📄 Detected {total_pages} pages in **{uploaded_file.name}**")
+    st.info(f"📄 Detected {total_pages_pdf} pages in **{uploaded_file.name}**")
     
     col1, col2 = st.columns(2)
     with col1:
-        start_page = st.number_input("Start Page", min_value=1, max_value=total_pages, value=1)
+        start_page = st.number_input("Start Page", min_value=1, max_value=total_pages_pdf, value=1)
     with col2:
-        end_page = st.number_input("End Page", min_value=1, max_value=total_pages, value=total_pages)
+        end_page = st.number_input("End Page", min_value=1, max_value=total_pages_pdf, value=total_pages_pdf)
         
-    # UI Toggle for Zipper Logic (Default: False)
     enable_zipper = st.checkbox(
         "Enable Multi-line Text Zipping", 
         value=False, 
@@ -279,11 +299,9 @@ if uploaded_file is not None:
         else:
             total_to_process = end_page - start_page + 1
             
-            # Setup dynamic UI tracking containers
             progress_text = st.empty()
             progress_bar = st.progress(0.0)
             
-            # Pure Python speed baseline (~0.12s per page)
             baseline_seconds_per_page = 0.12 
             initial_eta = total_to_process * baseline_seconds_per_page
             
@@ -297,7 +315,6 @@ if uploaded_file is not None:
             last_ui_update_time = 0
             
             try:
-                # Open PDF with pdfplumber
                 with pdfplumber.open(temp_pdf_path) as pdf:
                     for i, page_num in enumerate(range(start_page, end_page + 1)):
                         page = pdf.pages[page_num - 1]
@@ -313,7 +330,6 @@ if uploaded_file is not None:
                         remaining_pages = total_to_process - pages_processed
                         current_eta = remaining_pages * avg_time_per_page
                         
-                        # Throttle UI updates to prevent WebSocket lag and render freeze
                         current_time = time.time()
                         if current_time - last_ui_update_time > 0.4 or i == total_to_process - 1:
                             progress_text.markdown(
@@ -324,7 +340,6 @@ if uploaded_file is not None:
                             progress_bar.progress(min((i + 1) / total_to_process, 1.0))
                             last_ui_update_time = current_time
                         
-                        # Extract table with gridline rules (Lattice equivalent) [1]
                         tables = page.extract_tables(table_settings={
                             "vertical_strategy": "lines",
                             "horizontal_strategy": "lines",
@@ -336,10 +351,8 @@ if uploaded_file is not None:
                             if not table:
                                 continue
                             df = pd.DataFrame(table)
-                            # Remove system escape breaks (new lines inside single cell text)
                             df = df.replace(to_replace=[r'\r', r'\n'], value=' ', regex=True)
                             
-                            # Align header structure [1]
                             df = align_table_header(df)
                             
                             if not df.empty and len(df) > 1:
@@ -390,21 +403,17 @@ if uploaded_file is not None:
                             if master_df.empty:
                                 continue
                             
-                            # Detect column indices dynamically using the compiled layout
                             desc_idx, anchor_idx = detect_column_indices(master_df, master_df.iloc[0])
                             
-                            # 1. Clean Ghost Rows (artifacts) [1]
                             master_df = clean_ghost_rows_safe(master_df, desc_col_idx=desc_idx, anchor_col_idx=anchor_idx)
                             
-                            # 2. Run Zipper Logic ONLY if explicitly enabled [1]
                             if enable_zipper:
                                 master_df = zip_wrapped_text_optimized(master_df, desc_col_idx=desc_idx, anchor_col_idx=anchor_idx)
                             
-                            # 3. Clean duplicate page break headers globally [1]
                             master_df = remove_duplicate_headers(master_df, master_df.iloc[0])
                             
-                            # 4. Standardize text strings (keeps hyphens untouched, handles nan) [1]
-                            master_df = clean_raw_strings(master_df)
+                            # Clean raw strings and restore native date formats [1]
+                            master_df = clean_raw_strings_and_type_dates(master_df)
                             
                             sheet_name = f"Layout_Group_{idx}"
                             master_df.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
@@ -429,7 +438,7 @@ if uploaded_file is not None:
                     os.unlink(temp_pdf_path)
 
 # ==========================================
-# 4. SYSTEM REQ WARNINGS (FOOTER)
+# 5. SYSTEM REQUIREMENTS (FOOTER)
 # ==========================================
 st.markdown("---")
 st.caption("⚙️ Pure Python extraction engine. No Ghostscript required.")
